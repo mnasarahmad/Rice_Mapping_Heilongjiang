@@ -1,0 +1,1248 @@
+# -*- coding: utf-8 -*-
+"""
+HLJ Rice 2025 Automatic Mapping Workflow
+
+Requirements:
+- ArcGIS Pro Python environment
+- arcpy
+- numpy
+- pandas
+- matplotlib
+
+This script:
+1. Searches for exported HLJ prefecture GeoTIFFs
+2. Builds a province-wide rice mosaic
+3. Exports a clean final GeoTIFF
+4. Calculates mapped rice area by prefecture
+5. Creates publication-quality figures
+6. Creates a lightweight interactive HTML map
+
+User folder:
+C:\Users\Zohan\Downloads\Zohan202A
+"""
+
+from pathlib import Path
+import os
+import re
+import math
+import sys
+import traceback
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+import arcpy
+
+
+# ============================================================
+# 1. USER SETTINGS
+# ============================================================
+
+WORK_DIR = Path(r"C:\Users\Zohan\Downloads\Zohan202A")
+OUT_DIR = WORK_DIR / "HLJ_Rice_2025_Publication_Outputs"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+GDB_PATH = OUT_DIR / "HLJ_Rice_2025_Workspace.gdb"
+
+# Maximum display image dimension for the interactive HTML map.
+MAX_DISPLAY_SIZE = 2200
+
+# Main naming pattern used for final-rice prefecture exports.
+FINAL_FILE_PATTERN = re.compile(
+    r"HLJ_Rice_2025_.*_30m\.tif$",
+    flags=re.IGNORECASE
+)
+
+# Evidence rasters, if exported.
+EVIDENCE_FILE_PATTERN = re.compile(
+    r"HLJ_Rice_2025_.*Evidence.*\.tif$",
+    flags=re.IGNORECASE
+)
+
+
+# ============================================================
+# 2. BASIC SETUP
+# ============================================================
+
+def log(message):
+    print(message, flush=True)
+
+
+def ensure_workspace():
+    if not WORK_DIR.exists():
+        raise FileNotFoundError(
+            f"Working folder does not exist:\n{WORK_DIR}"
+        )
+
+    if not arcpy.Exists(str(GDB_PATH)):
+        arcpy.management.CreateFileGDB(
+            str(OUT_DIR),
+            GDB_PATH.name
+        )
+
+    arcpy.env.overwriteOutput = True
+
+    log(f"Working folder: {WORK_DIR}")
+    log(f"Output folder: {OUT_DIR}")
+    log(f"Geodatabase: {GDB_PATH}")
+
+
+# ============================================================
+# 3. FILE DISCOVERY
+# ============================================================
+
+def discover_files():
+    all_tifs = sorted(WORK_DIR.rglob("*.tif"))
+
+    final_prefecture_tifs = []
+    province_final_candidates = []
+    evidence_tifs = []
+
+    for path in all_tifs:
+        name = path.name
+
+        if EVIDENCE_FILE_PATTERN.search(name):
+            evidence_tifs.append(path)
+            continue
+
+        if "Final_Rice_30m" in name:
+            province_final_candidates.append(path)
+            continue
+
+        if FINAL_FILE_PATTERN.search(name):
+            final_prefecture_tifs.append(path)
+
+    log(f"All TIFF files found: {len(all_tifs)}")
+    log(f"Prefecture final-rice TIFFs: {len(final_prefecture_tifs)}")
+    log(f"Province final-rice candidates: {len(province_final_candidates)}")
+    log(f"Evidence TIFFs: {len(evidence_tifs)}")
+
+    if final_prefecture_tifs:
+        log("Final-rice TIFF examples:")
+        for path in final_prefecture_tifs[:10]:
+            log(f"  - {path.name}")
+
+    if not final_prefecture_tifs and not province_final_candidates:
+        available = "\n".join(f"  - {p.name}" for p in all_tifs[:50])
+        raise FileNotFoundError(
+            "No final-rice TIFF files matching the expected names were found.\n"
+            "Expected names similar to:\n"
+            "HLJ_Rice_2025_Harbin_30m.tif\n\n"
+            f"TIFF files found:\n{available}"
+        )
+
+    return final_prefecture_tifs, province_final_candidates, evidence_tifs
+
+
+# ============================================================
+# 4. MOSAIC CREATION
+# ============================================================
+
+def create_final_mosaic(final_prefecture_tifs, province_final_candidates):
+    mosaic_final = str(GDB_PATH / "HLJ_Rice_2025_Final_Mosaic")
+
+    if arcpy.Exists(mosaic_final):
+        arcpy.management.Delete(mosaic_final)
+
+    if province_final_candidates:
+        source = province_final_candidates[0]
+
+        arcpy.management.CopyRaster(
+            in_raster=str(source),
+            out_rasterdataset=mosaic_final,
+            pixel_type="8_BIT_UNSIGNED",
+            nodata_value="0"
+        )
+
+        log(f"Copied existing province raster: {source.name}")
+
+    else:
+        first = arcpy.Raster(str(final_prefecture_tifs[0]))
+
+        arcpy.management.MosaicToNewRaster(
+            input_rasters=";".join(
+                str(path) for path in final_prefecture_tifs
+            ),
+            output_location=str(GDB_PATH),
+            raster_dataset_name_with_extension=(
+                "HLJ_Rice_2025_Final_Mosaic"
+            ),
+            coordinate_system_for_the_raster=(
+                first.spatialReference
+            ),
+            pixel_type="8_BIT_UNSIGNED",
+            cellsize=first.meanCellWidth,
+            number_of_bands=1,
+            mosaic_method="MAXIMUM",
+            mosaic_colormap_mode="FIRST"
+        )
+
+        log(
+            f"Mosaic created from "
+            f"{len(final_prefecture_tifs)} prefecture rasters."
+        )
+
+    final_tif = OUT_DIR / "HLJ_Rice_2025_Final_Mosaic_30m.tif"
+
+    arcpy.management.CopyRaster(
+        in_raster=mosaic_final,
+        out_rasterdataset=str(final_tif),
+        pixel_type="8_BIT_UNSIGNED",
+        nodata_value="0",
+        format="TIFF"
+    )
+
+    log(f"Final mosaic GeoTIFF saved: {final_tif}")
+    return final_tif
+
+
+# ============================================================
+# 5. AREA CALCULATION
+# ============================================================
+
+def prefecture_name_from_file(path):
+    name = path.stem
+    name = re.sub(
+        r"^HLJ_Rice_2025_",
+        "",
+        name,
+        flags=re.IGNORECASE
+    )
+    name = re.sub(
+        r"_30m$",
+        "",
+        name,
+        flags=re.IGNORECASE
+    )
+    return name.replace("_", " ").strip()
+
+
+def raster_binary_area_ha(raster_path):
+    raster = arcpy.Raster(str(raster_path))
+    spatial_reference = raster.spatialReference
+
+    arr = arcpy.RasterToNumPyArray(
+        raster,
+        nodata_to_value=0
+    )
+
+    if arr.ndim == 3:
+        arr = arr[0]
+
+    positive_pixels = int(np.count_nonzero(arr > 0))
+
+    if spatial_reference.type == "Projected":
+        cell_area_m2 = abs(
+            raster.meanCellWidth *
+            raster.meanCellHeight
+        )
+
+        area_ha = (
+            positive_pixels *
+            cell_area_m2 /
+            10000.0
+        )
+
+        method = "projected_pixel_area"
+
+    else:
+        rows, cols = arr.shape
+        extent = raster.extent
+
+        pixel_width_deg = abs(
+            (extent.XMax - extent.XMin) / cols
+        )
+        pixel_height_deg = abs(
+            (extent.YMax - extent.YMin) / rows
+        )
+
+        km_per_deg_lat = 111.32
+        area_ha = 0.0
+
+        for row in range(rows):
+            latitude = (
+                extent.YMax -
+                (row + 0.5) * pixel_height_deg
+            )
+
+            km_per_deg_lon = (
+                111.32 *
+                math.cos(math.radians(latitude))
+            )
+
+            pixel_area_ha = (
+                pixel_width_deg *
+                km_per_deg_lon *
+                pixel_height_deg *
+                km_per_deg_lat *
+                100
+            )
+
+            row_count = int(
+                np.count_nonzero(arr[row, :] > 0)
+            )
+
+            area_ha += row_count * pixel_area_ha
+
+        method = (
+            "latitude_corrected_geographic_pixel_area"
+        )
+
+    return area_ha, positive_pixels, method
+
+
+def create_area_table(final_prefecture_tifs, final_mosaic_tif):
+    records = []
+
+    if final_prefecture_tifs:
+        for tif in final_prefecture_tifs:
+            log(f"Calculating area: {tif.name}")
+
+            area_ha, pixel_count, method = (
+                raster_binary_area_ha(tif)
+            )
+
+            records.append({
+                "prefecture": prefecture_name_from_file(tif),
+                "file_name": tif.name,
+                "rice_area_ha": area_ha,
+                "rice_area_km2": area_ha / 100.0,
+                "rice_pixel_count": pixel_count,
+                "area_method": method
+            })
+
+    else:
+        area_ha, pixel_count, method = (
+            raster_binary_area_ha(final_mosaic_tif)
+        )
+
+        records.append({
+            "prefecture": "Heilongjiang total",
+            "file_name": final_mosaic_tif.name,
+            "rice_area_ha": area_ha,
+            "rice_area_km2": area_ha / 100.0,
+            "rice_pixel_count": pixel_count,
+            "area_method": method
+        })
+
+    area_df = pd.DataFrame(records).sort_values(
+        "rice_area_ha",
+        ascending=False
+    ).reset_index(drop=True)
+
+    csv_path = (
+        OUT_DIR /
+        "HLJ_Rice_2025_Area_by_Prefecture.csv"
+    )
+
+    area_df.to_csv(csv_path, index=False)
+
+    log(f"Area table saved: {csv_path}")
+    log(
+        "Sum of mapped prefecture rice area (ha): "
+        f"{area_df['rice_area_ha'].sum():,.2f}"
+    )
+
+    return area_df
+
+
+# ============================================================
+# 6. RASTER READING FOR FIGURES
+# ============================================================
+
+def raster_to_array_and_extent(path):
+    raster = arcpy.Raster(str(path))
+
+    arr = arcpy.RasterToNumPyArray(
+        raster,
+        nodata_to_value=0
+    )
+
+    if arr.ndim == 3:
+        arr = arr[0]
+
+    ex = raster.extent
+    extent = [
+        ex.XMin,
+        ex.XMax,
+        ex.YMin,
+        ex.YMax
+    ]
+
+    return arr, extent, raster
+
+
+# ============================================================
+# 7. FINAL PUBLICATION MAP
+# ============================================================
+
+def create_final_rice_map(final_mosaic_tif):
+    arr, extent, raster = (
+        raster_to_array_and_extent(
+            final_mosaic_tif
+        )
+    )
+
+    rice_mask = np.where(
+        arr > 0,
+        1,
+        np.nan
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(10, 8),
+        dpi=300
+    )
+
+    ax.imshow(
+        rice_mask,
+        extent=extent,
+        origin="upper",
+        cmap="Greens",
+        vmin=0,
+        vmax=1,
+        interpolation="nearest"
+    )
+
+    ax.set_title(
+        "Spatial Distribution of Rice Fields "
+        "in Heilongjiang, 2025",
+        fontsize=16,
+        fontweight="bold",
+        pad=14
+    )
+
+    ax.set_xlabel(
+        "Longitude / Easting",
+        fontsize=12
+    )
+
+    ax.set_ylabel(
+        "Latitude / Northing",
+        fontsize=12
+    )
+
+    ax.tick_params(labelsize=10)
+    ax.grid(linewidth=0.35, alpha=0.35)
+
+    xmin, xmax, ymin, ymax = extent
+
+    # North arrow
+    nx = xmin + 0.92 * (xmax - xmin)
+    ny = ymin + 0.82 * (ymax - ymin)
+
+    ax.annotate(
+        "N",
+        xy=(
+            nx,
+            ny + 0.09 * (ymax - ymin)
+        ),
+        xytext=(nx, ny),
+        arrowprops=dict(
+            arrowstyle="-|>",
+            linewidth=1.5
+        ),
+        ha="center",
+        va="center",
+        fontsize=13,
+        fontweight="bold"
+    )
+
+    # Scale bar
+    if raster.spatialReference.type == "Geographic":
+        latitude_mid = (ymin + ymax) / 2.0
+
+        km_per_degree_lon = (
+            111.32 *
+            math.cos(math.radians(latitude_mid))
+        )
+
+        scale_km = 200
+        scale_width = scale_km / km_per_degree_lon
+
+    else:
+        scale_km = 200
+        scale_width = 200000
+
+    sx = xmin + 0.08 * (xmax - xmin)
+    sy = ymin + 0.07 * (ymax - ymin)
+
+    ax.plot(
+        [sx, sx + scale_width],
+        [sy, sy],
+        linewidth=3,
+        color="black"
+    )
+
+    tick_height = 0.008 * (ymax - ymin)
+
+    ax.plot(
+        [sx, sx],
+        [sy - tick_height, sy + tick_height],
+        color="black"
+    )
+
+    ax.plot(
+        [sx + scale_width, sx + scale_width],
+        [sy - tick_height, sy + tick_height],
+        color="black"
+    )
+
+    ax.text(
+        sx + scale_width / 2.0,
+        sy + 0.02 * (ymax - ymin),
+        f"{scale_km} km",
+        ha="center",
+        fontsize=10
+    )
+
+    legend_handle = Line2D(
+        [0], [0],
+        marker="s",
+        linestyle="None",
+        markerfacecolor=plt.cm.Greens(0.8),
+        markeredgecolor="none",
+        markersize=12,
+        label="Mapped rice"
+    )
+
+    ax.legend(
+        handles=[legend_handle],
+        loc="lower right",
+        frameon=True,
+        fontsize=10
+    )
+
+    plt.tight_layout()
+
+    png_path = (
+        OUT_DIR /
+        "Figure_1_HLJ_Final_Rice_Map_2025.png"
+    )
+
+    pdf_path = (
+        OUT_DIR /
+        "Figure_1_HLJ_Final_Rice_Map_2025.pdf"
+    )
+
+    fig.savefig(
+        png_path,
+        dpi=600,
+        bbox_inches="tight"
+    )
+
+    fig.savefig(
+        pdf_path,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+    log(f"Final map saved: {png_path}")
+    log(f"Final map saved: {pdf_path}")
+
+    return arr, extent, raster
+
+
+# ============================================================
+# 8. PREFECTURE AREA CHART
+# ============================================================
+
+def create_prefecture_area_chart(area_df):
+    if len(area_df) <= 1:
+        log(
+            "Prefecture area chart skipped because "
+            "only one area record was available."
+        )
+        return
+
+    plot_df = area_df.sort_values(
+        "rice_area_ha",
+        ascending=True
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(10, 7),
+        dpi=300
+    )
+
+    values = (
+        plot_df["rice_area_ha"] /
+        1000.0
+    )
+
+    bars = ax.barh(
+        plot_df["prefecture"],
+        values
+    )
+
+    ax.set_xlabel(
+        "Mapped rice area (thousand ha)",
+        fontsize=12
+    )
+
+    ax.set_ylabel(
+        "Prefecture",
+        fontsize=12
+    )
+
+    ax.set_title(
+        "Mapped Rice Area by Heilongjiang "
+        "Prefecture, 2025",
+        fontsize=15,
+        fontweight="bold",
+        pad=12
+    )
+
+    ax.tick_params(labelsize=10)
+    ax.grid(axis="x", alpha=0.3)
+
+    for bar, value in zip(bars, values):
+        ax.text(
+            bar.get_width(),
+            bar.get_y() + bar.get_height() / 2.0,
+            f" {value:,.1f}",
+            va="center",
+            fontsize=9
+        )
+
+    plt.tight_layout()
+
+    png_path = (
+        OUT_DIR /
+        "Figure_2_Rice_Area_by_Prefecture.png"
+    )
+
+    pdf_path = (
+        OUT_DIR /
+        "Figure_2_Rice_Area_by_Prefecture.pdf"
+    )
+
+    fig.savefig(
+        png_path,
+        dpi=600,
+        bbox_inches="tight"
+    )
+
+    fig.savefig(
+        pdf_path,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+    log(f"Area chart saved: {png_path}")
+    log(f"Area chart saved: {pdf_path}")
+
+
+# ============================================================
+# 9. OPTIONAL EVIDENCE MOSAIC
+# ============================================================
+
+def create_evidence_outputs(evidence_tifs):
+    if not evidence_tifs:
+        log(
+            "No evidence TIFFs found. "
+            "Evidence figures were skipped."
+        )
+        return
+
+    mosaic_evidence = str(
+        GDB_PATH /
+        "HLJ_Rice_2025_Evidence_Mosaic"
+    )
+
+    if arcpy.Exists(mosaic_evidence):
+        arcpy.management.Delete(
+            mosaic_evidence
+        )
+
+    first = arcpy.Raster(
+        str(evidence_tifs[0])
+    )
+
+    arcpy.management.MosaicToNewRaster(
+        input_rasters=";".join(
+            str(path) for path in evidence_tifs
+        ),
+        output_location=str(GDB_PATH),
+        raster_dataset_name_with_extension=(
+            "HLJ_Rice_2025_Evidence_Mosaic"
+        ),
+        coordinate_system_for_the_raster=(
+            first.spatialReference
+        ),
+        pixel_type="8_BIT_UNSIGNED",
+        cellsize=first.meanCellWidth,
+        number_of_bands=9,
+        mosaic_method="MAXIMUM",
+        mosaic_colormap_mode="FIRST"
+    )
+
+    evidence_tif = (
+        OUT_DIR /
+        "HLJ_Rice_2025_Evidence_Mosaic_9Bands.tif"
+    )
+
+    arcpy.management.CopyRaster(
+        in_raster=mosaic_evidence,
+        out_rasterdataset=str(evidence_tif),
+        pixel_type="8_BIT_UNSIGNED",
+        nodata_value="0",
+        format="TIFF"
+    )
+
+    log(f"Evidence mosaic saved: {evidence_tif}")
+
+    raster = arcpy.Raster(str(evidence_tif))
+    arr = arcpy.RasterToNumPyArray(
+        raster,
+        nodata_to_value=0
+    )
+
+    if arr.ndim != 3 or arr.shape[0] < 9:
+        log(
+            "Evidence raster does not contain "
+            "the expected 9 bands. "
+            "Evidence figures were skipped."
+        )
+        return
+
+    ex = raster.extent
+    extent = [
+        ex.XMin,
+        ex.XMax,
+        ex.YMin,
+        ex.YMax
+    ]
+
+    final_rice = arr[0]
+    flood_water = arr[3]
+    sar_flood = arr[4]
+    green_canopy = arr[5]
+    possible_missed = arr[7]
+    possible_false = arr[8]
+
+    def binary_mask(a):
+        return np.where(
+            a > 0,
+            1,
+            np.nan
+        )
+
+    # Evidence panel
+    fig, axes = plt.subplots(
+        2, 2,
+        figsize=(12, 10),
+        dpi=300
+    )
+
+    panel = [
+        (
+            flood_water,
+            "A. Flood-water evidence",
+            "Blues"
+        ),
+        (
+            sar_flood,
+            "B. SAR-flood evidence",
+            "Purples"
+        ),
+        (
+            green_canopy,
+            "C. Green-canopy evidence",
+            "Greens"
+        ),
+        (
+            final_rice,
+            "D. Final rice map",
+            "Greens"
+        )
+    ]
+
+    for axis, (
+        layer,
+        title,
+        cmap
+    ) in zip(axes.ravel(), panel):
+
+        axis.imshow(
+            binary_mask(layer),
+            extent=extent,
+            origin="upper",
+            cmap=cmap,
+            interpolation="nearest"
+        )
+
+        axis.set_title(
+            title,
+            fontsize=12,
+            fontweight="bold"
+        )
+
+        axis.set_xlabel(
+            "Longitude / Easting",
+            fontsize=9
+        )
+
+        axis.set_ylabel(
+            "Latitude / Northing",
+            fontsize=9
+        )
+
+        axis.grid(
+            linewidth=0.3,
+            alpha=0.3
+        )
+
+    fig.suptitle(
+        "Phenological and SAR–Optical "
+        "Evidence for Rice Mapping",
+        fontsize=16,
+        fontweight="bold",
+        y=0.98
+    )
+
+    plt.tight_layout()
+
+    panel_png = (
+        OUT_DIR /
+        "Figure_3_Phenological_Evidence_Panel.png"
+    )
+
+    panel_pdf = (
+        OUT_DIR /
+        "Figure_3_Phenological_Evidence_Panel.pdf"
+    )
+
+    fig.savefig(
+        panel_png,
+        dpi=600,
+        bbox_inches="tight"
+    )
+
+    fig.savefig(
+        panel_pdf,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+    # Diagnostic uncertainty map
+    rgb = np.ones(
+        (
+            final_rice.shape[0],
+            final_rice.shape[1],
+            3
+        ),
+        dtype=np.float32
+    )
+
+    rgb[final_rice > 0] = [
+        0.0,
+        0.45,
+        0.0
+    ]
+
+    rgb[possible_missed > 0] = [
+        1.0,
+        0.55,
+        0.0
+    ]
+
+    rgb[possible_false > 0] = [
+        0.90,
+        0.0,
+        0.0
+    ]
+
+    fig, ax = plt.subplots(
+        figsize=(10, 8),
+        dpi=300
+    )
+
+    ax.imshow(
+        rgb,
+        extent=extent,
+        origin="upper",
+        interpolation="nearest"
+    )
+
+    ax.set_title(
+        "Diagnostic Rice-Mapping "
+        "Uncertainty Map",
+        fontsize=16,
+        fontweight="bold",
+        pad=12
+    )
+
+    ax.set_xlabel(
+        "Longitude / Easting",
+        fontsize=12
+    )
+
+    ax.set_ylabel(
+        "Latitude / Northing",
+        fontsize=12
+    )
+
+    ax.grid(
+        linewidth=0.35,
+        alpha=0.35
+    )
+
+    handles = [
+        Line2D(
+            [0], [0],
+            marker="s",
+            linestyle="None",
+            markerfacecolor=(0.0, 0.45, 0.0),
+            markersize=11,
+            label="Final rice"
+        ),
+        Line2D(
+            [0], [0],
+            marker="s",
+            linestyle="None",
+            markerfacecolor=(1.0, 0.55, 0.0),
+            markersize=11,
+            label="Possible missed rice"
+        ),
+        Line2D(
+            [0], [0],
+            marker="s",
+            linestyle="None",
+            markerfacecolor=(0.90, 0.0, 0.0),
+            markersize=11,
+            label="Possible false rice"
+        )
+    ]
+
+    ax.legend(
+        handles=handles,
+        loc="lower left",
+        frameon=True,
+        fontsize=10
+    )
+
+    plt.tight_layout()
+
+    diagnostic_png = (
+        OUT_DIR /
+        "Figure_4_Diagnostic_Uncertainty_Map.png"
+    )
+
+    diagnostic_pdf = (
+        OUT_DIR /
+        "Figure_4_Diagnostic_Uncertainty_Map.pdf"
+    )
+
+    fig.savefig(
+        diagnostic_png,
+        dpi=600,
+        bbox_inches="tight"
+    )
+
+    fig.savefig(
+        diagnostic_pdf,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+    log(
+        "Evidence and diagnostic figures saved."
+    )
+
+
+# ============================================================
+# 10. INTERACTIVE HTML MAP
+# ============================================================
+
+def create_interactive_map(
+    final_arr,
+    extent
+):
+    interactive_dir = (
+        OUT_DIR /
+        "interactive_map"
+    )
+
+    interactive_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    rows, cols = final_arr.shape
+
+    factor = max(
+        1,
+        int(
+            math.ceil(
+                max(rows, cols) /
+                MAX_DISPLAY_SIZE
+            )
+        )
+    )
+
+    display_arr = final_arr[
+        ::factor,
+        ::factor
+    ]
+
+    rgba = np.zeros(
+        (
+            display_arr.shape[0],
+            display_arr.shape[1],
+            4
+        ),
+        dtype=np.uint8
+    )
+
+    rice_mask = display_arr > 0
+
+    rgba[rice_mask, 0] = 0
+    rgba[rice_mask, 1] = 115
+    rgba[rice_mask, 2] = 35
+    rgba[rice_mask, 3] = 205
+
+    overlay_path = (
+        interactive_dir /
+        "final_rice_overlay.png"
+    )
+
+    plt.imsave(
+        overlay_path,
+        rgba
+    )
+
+    xmin, xmax, ymin, ymax = extent
+    center_lat = (ymin + ymax) / 2.0
+    center_lon = (xmin + xmax) / 2.0
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HLJ Rice 2025 Interactive Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+html, body, #map {{
+  height: 100%;
+  margin: 0;
+}}
+.title {{
+  position: fixed;
+  top: 12px;
+  left: 52px;
+  z-index: 9999;
+  background: rgba(255,255,255,0.94);
+  padding: 10px 14px;
+  border: 1px solid #666;
+  border-radius: 4px;
+  font-family: Arial;
+  font-size: 17px;
+  font-weight: bold;
+}}
+.subtitle {{
+  font-size: 12px;
+  font-weight: normal;
+  margin-top: 4px;
+}}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="title">
+HLJ Rice 2025 Interactive Map
+<div class="subtitle">
+Mapped rice distribution from the Sentinel-1/2 phenology framework
+</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+var map = L.map('map').setView(
+  [{center_lat}, {center_lon}],
+  6
+);
+
+var osm = L.tileLayer(
+  'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+  {{
+    maxZoom: 18,
+    attribution: '&copy; OpenStreetMap contributors'
+  }}
+).addTo(map);
+
+var bounds = [
+  [{ymin}, {xmin}],
+  [{ymax}, {xmax}]
+];
+
+var rice = L.imageOverlay(
+  'final_rice_overlay.png',
+  bounds,
+  {{
+    opacity: 0.88,
+    interactive: true
+  }}
+).addTo(map);
+
+L.control.layers(
+  {{
+    "OpenStreetMap": osm
+  }},
+  {{
+    "Final rice 2025": rice
+  }},
+  {{
+    collapsed: false
+  }}
+).addTo(map);
+
+L.control.scale().addTo(map);
+map.fitBounds(bounds);
+</script>
+</body>
+</html>
+"""
+
+    html_path = (
+        interactive_dir /
+        "HLJ_Rice_2025_Interactive_Map.html"
+    )
+
+    html_path.write_text(
+        html,
+        encoding="utf-8"
+    )
+
+    log(
+        f"Interactive HTML map saved: "
+        f"{html_path}"
+    )
+
+
+# ============================================================
+# 11. OUTPUT SUMMARY
+# ============================================================
+
+def write_output_summary():
+    summary_path = (
+        OUT_DIR /
+        "OUTPUT_SUMMARY.txt"
+    )
+
+    generated_files = sorted(
+        path for path in OUT_DIR.rglob("*")
+        if path.is_file()
+    )
+
+    content = [
+        "HLJ Rice 2025 — Generated Outputs",
+        "",
+        f"Output directory: {OUT_DIR}",
+        "",
+        "Files:"
+    ]
+
+    content.extend(
+        f"- {path.relative_to(OUT_DIR)}"
+        for path in generated_files
+    )
+
+    summary_path.write_text(
+        "\n".join(content),
+        encoding="utf-8"
+    )
+
+    log(f"Output summary saved: {summary_path}")
+
+
+# ============================================================
+# 12. MAIN WORKFLOW
+# ============================================================
+
+def main():
+    log("=" * 65)
+    log("HLJ RICE 2025 AUTOMATIC MAPPING WORKFLOW")
+    log("=" * 65)
+
+    ensure_workspace()
+
+    (
+        final_prefecture_tifs,
+        province_final_candidates,
+        evidence_tifs
+    ) = discover_files()
+
+    final_mosaic_tif = create_final_mosaic(
+        final_prefecture_tifs,
+        province_final_candidates
+    )
+
+    area_df = create_area_table(
+        final_prefecture_tifs,
+        final_mosaic_tif
+    )
+
+    final_arr, final_extent, _ = (
+        create_final_rice_map(
+            final_mosaic_tif
+        )
+    )
+
+    create_prefecture_area_chart(
+        area_df
+    )
+
+    create_evidence_outputs(
+        evidence_tifs
+    )
+
+    create_interactive_map(
+        final_arr,
+        final_extent
+    )
+
+    write_output_summary()
+
+    log("=" * 65)
+    log("WORKFLOW COMPLETED SUCCESSFULLY")
+    log(f"Open this folder:\n{OUT_DIR}")
+    log("=" * 65)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+
+    except Exception as exc:
+        error_path = (
+            OUT_DIR /
+            "ERROR_LOG.txt"
+        )
+
+        error_text = (
+            f"Error: {exc}\n\n"
+            f"{traceback.format_exc()}"
+        )
+
+        try:
+            error_path.write_text(
+                error_text,
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+        print(error_text)
+        print(
+            f"\nAn error log was written to:\n"
+            f"{error_path}"
+        )
+
+        raise
